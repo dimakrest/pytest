@@ -21,6 +21,7 @@ from .pathlib import cleanup_dead_symlinks
 from .pathlib import LOCK_TIMEOUT
 from .pathlib import make_numbered_dir
 from .pathlib import make_numbered_dir_with_cleanup
+from .pathlib import NumberedDirCache
 from .pathlib import rm_rf
 from _pytest.compat import get_user_id
 from _pytest.config import Config
@@ -79,6 +80,9 @@ class TempPathFactory:
         # Register cleanups for session finish. Also called atexit as a last
         # resort if sessionfinish for some reason doesn't happen.
         self._exit_stack = ExitStack()
+        # The listing of the base temp directory, so that mktemp does not list
+        # it on every call.
+        self._numbered_dir_cache = NumberedDirCache()
 
     @classmethod
     def from_config(
@@ -133,8 +137,14 @@ class TempPathFactory:
         if not numbered:
             p = self.getbasetemp().joinpath(basename)
             p.mkdir(mode=0o700)
+            self._numbered_dir_cache.add(self.getbasetemp(), p.name)
         else:
-            p = make_numbered_dir(root=self.getbasetemp(), prefix=basename, mode=0o700)
+            p = make_numbered_dir(
+                root=self.getbasetemp(),
+                prefix=basename,
+                mode=0o700,
+                _cache=self._numbered_dir_cache,
+            )
             self._trace("mktemp", p)
         return p
 
@@ -151,6 +161,7 @@ class TempPathFactory:
             basetemp = self._given_basetemp
             if basetemp.exists():
                 rm_rf(basetemp)
+                self._numbered_dir_cache.clear()
             basetemp.mkdir(mode=0o700)
             basetemp = basetemp.resolve()
         else:
@@ -301,7 +312,7 @@ def tmp_path(
     if policy == "failed" and result_dict.get("call", True):
         # We do a "best effort" to remove files, but it might not be possible due to some leaked resource,
         # permissions, etc, in which case we ignore it.
-        rmtree(path, ignore_errors=True)
+        tmp_path_factory._numbered_dir_cache.rmtree(path)
 
     del request.node.stash[tmppath_result_key]
 

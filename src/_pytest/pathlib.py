@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import bisect
 from collections.abc import Callable
 from collections.abc import Iterable
 from collections.abc import Iterator
@@ -29,6 +30,7 @@ import sys
 import types
 from types import ModuleType
 from typing import Any
+from typing import NamedTuple
 from typing import TypeVar
 import uuid
 import warnings
@@ -265,19 +267,161 @@ def _force_symlink(root: Path, target: str | PurePath, link_to: str | Path) -> N
         pass
 
 
-def make_numbered_dir(root: Path, prefix: str, mode: int = 0o700) -> Path:
-    """Create a directory with an increased number as suffix for the given prefix."""
+class _DirSignature(NamedTuple):
+    dev: int
+    ino: int
+    mtime_ns: int
+    ctime_ns: int
+    nlink: int
+
+
+def _dir_signature(root: Path) -> _DirSignature | None:
+    """Return the parts of root's stat that change when entries are added or removed.
+
+    Returns None if root's mtime is a whole number of milliseconds, as on
+    filesystems with 1 or 2 second timestamps, which are too coarse to show
+    every change.
+    """
+    st = os.stat(root)
+    if st.st_mtime_ns % 1_000_000 == 0:
+        return None
+    return _DirSignature(
+        st.st_dev, st.st_ino, st.st_mtime_ns, st.st_ctime_ns, st.st_nlink
+    )
+
+
+class NumberedDirCache:
+    """A listing of one directory, kept between :func:`make_numbered_dir` calls
+    by the owner of the directory.
+
+    The listing is only used while the directory's stat is unchanged. It is a
+    hint: mkdir decides whether a number is free.
+    """
+
+    _signature: _DirSignature | None
+    # (name.lower(), name), sorted, so names sharing a lower-cased prefix are adjacent.
+    _entries: list[tuple[str, str]]
+    # prefix -> largest number, and lower-cased prefix -> prefixes in _max.
+    _max: dict[str, int]
+    _by_lower: dict[str, list[str]]
+
+    def __init__(self) -> None:
+        self.clear()
+
+    def clear(self) -> None:
+        self._signature = None
+        self._entries = []
+        self._max = {}
+        self._by_lower = {}
+
+    def max_number(self, root: Path, prefix: str) -> int:
+        """Return ``max(map(parse_num, find_suffixes(root, prefix)), default=-1)``,
+        listing root only if it changed."""
+        signature = _dir_signature(root)
+        if signature is None or signature != self._signature:
+            self.clear()
+            names = [entry.name for entry in os.scandir(root)]
+            self._entries = sorted((name.lower(), name) for name in names)
+            if signature is not None and _dir_signature(root) == signature:
+                self._signature = signature
+        if prefix in self._max:
+            return self._max[prefix]
+        l_prefix = prefix.lower()
+        entries = self._entries
+        i = bisect.bisect_left(entries, (l_prefix,))
+        max_existing = -1
+        while i < len(entries) and entries[i][0].startswith(l_prefix):
+            max_existing = max(max_existing, parse_num(entries[i][1][len(prefix) :]))
+            i += 1
+        self._max[prefix] = max_existing
+        self._by_lower.setdefault(l_prefix, []).append(prefix)
+        return max_existing
+
+    def add(self, root: Path, name: str) -> None:
+        """Record that the owner created the directory name in root."""
+        if not self._record(root, +1):
+            return
+        l_name = name.lower()
+        bisect.insort(self._entries, (l_name, name))
+        # Update every known prefix that name matches, e.g. "test_a" for "test_a10".
+        for k in range(len(l_name) + 1):
+            for prefix in self._by_lower.get(l_name[:k], ()):
+                self._max[prefix] = max(
+                    self._max.get(prefix, -1), parse_num(name[len(prefix) :])
+                )
+
+    def rmtree(self, path: Path) -> None:
+        """Remove path, a directory the owner created, like
+        ``shutil.rmtree(path, ignore_errors=True)``, and record it."""
+        signature = self._signature
+        try:
+            valid = signature is not None and _dir_signature(path.parent) == signature
+        except OSError:
+            valid = False
+        shutil.rmtree(path, ignore_errors=True)
+        if not valid or os.path.lexists(path) or not self._record(path.parent, -1):
+            self.clear()
+            return
+        entry = (path.name.lower(), path.name)
+        i = bisect.bisect_left(self._entries, entry)
+        if i < len(self._entries) and self._entries[i] == entry:
+            del self._entries[i]
+        # Forget the maximum of every known prefix that the name matches.
+        for k in range(len(entry[0]) + 1):
+            for prefix in self._by_lower.pop(entry[0][:k], ()):
+                self._max.pop(prefix, None)
+
+    def _record(self, root: Path, nlink_change: int) -> bool:
+        """Take root's new stat as current if the owner's change explains it."""
+        old = self._signature
+        try:
+            new = _dir_signature(root)
+        except OSError:
+            new = None
+        # st_nlink counts the subdirectories on most filesystems; it is 1 on
+        # those that do not count them.
+        if (
+            old is None
+            or new is None
+            or (new.dev, new.ino) != (old.dev, old.ino)
+            or (old.nlink >= 2 and new.nlink != old.nlink + nlink_change)
+        ):
+            self.clear()
+            return False
+        self._signature = new
+        return True
+
+
+def make_numbered_dir(
+    root: Path,
+    prefix: str,
+    mode: int = 0o700,
+    *,
+    _cache: NumberedDirCache | None = None,
+) -> Path:
+    """Create a directory with an increased number as suffix for the given prefix.
+
+    :param _cache:
+        Used instead of listing root while root is unchanged. Only the owner of
+        root, which records its own changes to root in it, passes one.
+    """
     for i in range(10):
         # try up to 10 times to create the directory
-        max_existing = max(map(parse_num, find_suffixes(root, prefix)), default=-1)
+        if _cache is None:
+            max_existing = max(map(parse_num, find_suffixes(root, prefix)), default=-1)
+        else:
+            max_existing = _cache.max_number(root, prefix)
         new_number = max_existing + 1
         new_path = root.joinpath(f"{prefix}{new_number}")
         try:
             new_path.mkdir(mode=mode)
         except Exception:
-            pass
+            if _cache is not None:
+                _cache.clear()
         else:
             _force_symlink(root, prefix + "current", new_path)
+            if _cache is not None:
+                _cache.add(root, new_path.name)
             return new_path
     else:
         raise OSError(

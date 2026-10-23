@@ -8,6 +8,7 @@ from pathlib import Path
 import shutil
 import stat
 import sys
+import time
 from typing import cast
 import warnings
 
@@ -58,6 +59,59 @@ class FakeConfig:
         return self
 
 
+def patch_stat(monkeypatch: MonkeyPatch, path: Path, **change) -> None:
+    """Make os.stat(path) report other values: each keyword is a stat field
+    (st_mtime_ns, st_ctime_ns, st_nlink) and a function of its real value."""
+    real_stat = os.stat
+
+    def fake_stat(p, *args, **kwargs):
+        st = real_stat(p, *args, **kwargs)
+        if isinstance(p, int) or os.fspath(p) != os.fspath(path):
+            return st
+        values = list(st[:10])
+        values[3] = change.get("st_nlink", lambda n: n)(st.st_nlink)
+        times = {
+            f: change.get(f, lambda t: t)(getattr(st, f))
+            for f in ("st_atime_ns", "st_mtime_ns", "st_ctime_ns")
+        }
+        return os.stat_result(values, times)
+
+    monkeypatch.setattr(os, "stat", fake_stat)
+
+
+def count_listings(monkeypatch: MonkeyPatch, path: Path) -> list[int]:
+    """Count the os.scandir(path) calls from now on."""
+    calls = [0]
+    real_scandir = os.scandir
+
+    def scandir(p="."):
+        if not isinstance(p, int) and os.fspath(p) == os.fspath(path):
+            calls[0] += 1
+        return real_scandir(p)
+
+    monkeypatch.setattr(os, "scandir", scandir)
+    return calls
+
+
+def wait_for_clock_tick(path: Path, probe: Path) -> None:
+    """Wait until a change to the directory path gets a later timestamp than
+    its last one, by creating the directory probe elsewhere.
+
+    With a coarse filesystem clock, a change in the same tick as mktemp's last
+    look at the directory may not show in its stat. That limit is documented
+    and not what the tests using this are about.
+    """
+    mtime = os.stat(path).st_mtime_ns
+    for _ in range(1000):
+        probe.mkdir()
+        later = os.stat(probe).st_mtime_ns > mtime
+        probe.rmdir()
+        if later:
+            return
+        time.sleep(0.01)
+    pytest.fail("the filesystem clock did not advance in 10 seconds")
+
+
 class TestTmpPathHandler:
     def test_mktemp(self, tmp_path: Path) -> None:
         config = cast(Config, FakeConfig(tmp_path))
@@ -78,6 +132,162 @@ class TestTmpPathHandler:
         config = cast(Config, FakeConfig("hello"))
         t = TempPathFactory.from_config(config, _ispytest=True)
         assert t.getbasetemp().resolve() == (tmp_path / "hello").resolve()
+
+
+class TestMktempNumbering:
+    """mktemp keeps the listing of the base temp directory between calls. The
+    names must still be those that a fresh listing on every call gives."""
+
+    @pytest.fixture
+    def factory(self, tmp_path: Path) -> TempPathFactory:
+        config = cast(Config, FakeConfig(tmp_path / "basetemp"))
+        return TempPathFactory.from_config(config, _ispytest=True)
+
+    def test_lists_basetemp_once(self, factory, monkeypatch):
+        listings = count_listings(monkeypatch, factory.getbasetemp())
+        names = [factory.mktemp("world").name for _ in range(20)]
+        assert names == [f"world{i}" for i in range(20)]
+        # Not always 1: where the timestamps or st_nlink cannot show our own
+        # change reliably, the next call lists again.
+        assert listings[0] < 10
+
+    def test_numbering_restarts_when_basetemp_is_reused(self, tmp_path, monkeypatch):
+        config = cast(Config, FakeConfig(tmp_path / "basetemp"))
+        factory = TempPathFactory.from_config(config, _ispytest=True)
+        for _ in range(2):
+            assert [factory.mktemp("world").name for _ in range(3)] == [
+                "world0",
+                "world1",
+                "world2",
+            ]
+            # The same --basetemp again, as pytester.inline_run uses it.
+            factory = TempPathFactory.from_config(config, _ispytest=True)
+        factory.mktemp("world")
+        # The same factory setting up its basetemp again.
+        monkeypatch.setattr(factory, "_basetemp", None)
+        assert factory.mktemp("world").name == "world0"
+
+    def test_sees_changes_by_others(self, factory, tmp_path):
+        basetemp = factory.getbasetemp()
+        factory.mktemp("fun-")
+        wait_for_clock_tick(basetemp, tmp_path / "tick")
+        basetemp.joinpath("fun-7").mkdir()
+        assert factory.mktemp("fun-").name == "fun-8"
+        # A file does not change st_nlink, only the timestamps.
+        wait_for_clock_tick(basetemp, tmp_path / "tick")
+        basetemp.joinpath("fun-11").touch()
+        assert factory.mktemp("fun-").name == "fun-12"
+        # A removed number is used again, as with a fresh listing.
+        wait_for_clock_tick(basetemp, tmp_path / "tick")
+        basetemp.joinpath("fun-12").rmdir()
+        basetemp.joinpath("fun-11").unlink()
+        assert factory.mktemp("fun-").name == "fun-9"
+
+    @pytest.mark.skipif(
+        sys.platform == "win32", reason="st_ctime is the creation time on Windows"
+    )
+    def test_sees_change_with_mtime_set_back(self, factory, tmp_path):
+        basetemp = factory.getbasetemp()
+        factory.mktemp("fun-")
+        st = os.stat(basetemp)
+        wait_for_clock_tick(basetemp, tmp_path / "tick")
+        basetemp.joinpath("fun-5").touch()
+        # Restore the old mtime, as touch -r or rsync -t do; st_ctime changes.
+        os.utime(basetemp, ns=(st.st_atime_ns, st.st_mtime_ns))
+        assert factory.mktemp("fun-").name == "fun-6"
+
+    def test_sees_change_with_frozen_timestamps(self, factory, monkeypatch):
+        # The timestamps can miss a change (coarse clock); a new subdirectory
+        # still shows in st_nlink where it counts them.
+        basetemp = factory.getbasetemp()
+        if os.stat(basetemp).st_nlink < 2:
+            pytest.skip("st_nlink does not count subdirectories here")
+        frozen = lambda t: 1_234_567_891  # noqa: E731
+        patch_stat(monkeypatch, basetemp, st_mtime_ns=frozen, st_ctime_ns=frozen)
+        factory.mktemp("fun-")
+        basetemp.joinpath("fun-7").mkdir()
+        assert factory.mktemp("fun-").name == "fun-8"
+        # Also when it happens while mktemp creates its own directory.
+        real_mkdir = Path.mkdir
+        foreign = [basetemp / "fun-20"]
+
+        def mkdir(self, *args, **kwargs):
+            while foreign:
+                real_mkdir(foreign.pop())
+            real_mkdir(self, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "mkdir", mkdir)
+        assert factory.mktemp("fun-").name == "fun-9"
+        assert factory.mktemp("fun-").name == "fun-21"
+
+    def test_lists_again_when_number_is_taken(self, factory, monkeypatch):
+        # A change that the stat does not show: the next number is taken.
+        basetemp = factory.getbasetemp()
+        frozen = lambda t: 1_234_567_891  # noqa: E731
+        patch_stat(
+            monkeypatch,
+            basetemp,
+            st_mtime_ns=frozen,
+            st_ctime_ns=frozen,
+            st_nlink=lambda n: 1,
+        )
+        factory.mktemp("fun-")
+        basetemp.joinpath("fun-1").mkdir()
+        assert factory.mktemp("fun-").name == "fun-2"
+
+    def test_sees_change_while_listing(self, factory, tmp_path, monkeypatch):
+        basetemp = factory.getbasetemp()
+        real_scandir = os.scandir
+
+        def scandir(p="."):
+            entries = list(real_scandir(p))
+            wait_for_clock_tick(basetemp, tmp_path / "tick")
+            basetemp.joinpath("fun-30").touch()
+            monkeypatch.setattr(os, "scandir", real_scandir)
+            return iter(entries)
+
+        monkeypatch.setattr(os, "scandir", scandir)
+        assert factory.mktemp("fun-").name == "fun-0"
+        assert factory.mktemp("fun-").name == "fun-31"
+
+    @pytest.mark.parametrize("seconds", [1, 2])
+    def test_lists_every_time_with_coarse_timestamps(
+        self, factory, monkeypatch, seconds
+    ):
+        # Filesystems with 1 or 2 second timestamps (FAT, HFS+, ext3).
+        basetemp = factory.getbasetemp()
+        step = seconds * 1_000_000_000
+        coarse = lambda t: t // step * step  # noqa: E731
+        patch_stat(monkeypatch, basetemp, st_mtime_ns=coarse, st_ctime_ns=coarse)
+        listings = count_listings(monkeypatch, basetemp)
+        for i in range(3):
+            assert factory.mktemp("fun-").name == f"fun-{i}"
+            basetemp.joinpath(f"other{i}").touch()
+        assert listings[0] == 3
+
+    def test_case_insensitive(self, factory):
+        assert factory.mktemp("test_a").name == "test_a0"
+        assert factory.mktemp("test_A").name == "test_A1"
+        assert factory.mktemp("test_a").name == "test_a2"
+
+    def test_overlapping_names(self, factory):
+        # The number is everything after the name, so test_a10 is number 10
+        # of test_a, and test_a1 is number 0 of test_a1.
+        for _ in range(3):
+            factory.mktemp("test_a")
+        for _ in range(2):
+            factory.mktemp("test_a1")
+        assert factory.mktemp("test_a").name == "test_a12"
+        assert factory.mktemp("test_a1").name == "test_a13"
+
+    def test_names_ending_in_digits(self, tmp_path):
+        for name in ["test_v0", "test_v1", "test_v2", "test_v20", "test_v21"]:
+            tmp_path.joinpath(name).mkdir()
+        factory = TempPathFactory(
+            None, 3, "all", lambda *args: None, basetemp=tmp_path, _ispytest=True
+        )
+        assert factory.mktemp("test_v2").name == "test_v22"
+        assert factory.mktemp("test_v").name == "test_v23"
 
 
 class TestConfigTmpPath:
@@ -222,6 +432,42 @@ class TestConfigTmpPath:
             base_dir = filter(lambda x: not x.is_symlink(), child.iterdir())
             # Check the base dir itself is gone
             assert len(list(base_dir)) == 0
+
+    def test_policy_failed_numbering_unseen_by_stat(
+        self, pytester: Pytester, monkeypatch: MonkeyPatch
+    ) -> None:
+        # Where the base temp directory's stat does not show pytest's own
+        # changes to it (Windows: a coarse clock and st_nlink 1), the names must
+        # still be those of a fresh listing.
+        basetemp = pytester.path / "basetemp"
+        frozen = lambda t: 1_234_567_891  # noqa: E731
+        patch_stat(
+            monkeypatch,
+            basetemp,
+            st_mtime_ns=frozen,
+            st_ctime_ns=frozen,
+            st_nlink=lambda n: 1,
+        )
+        listings = count_listings(monkeypatch, basetemp)
+        pytester.makepyprojecttoml(
+            """
+            [tool.pytest.ini_options]
+            tmp_path_retention_policy = "failed"
+        """
+        )
+        same_name = "def test_x(tmp_path):\n    assert tmp_path.name == {!r}\n"
+        pytester.makepyfile(
+            test_a=same_name.format("test_x0"),
+            test_b=same_name.format("test_x0"),
+            test_c="""
+            def test_y(tmp_path_factory):
+                tmp_path_factory.mktemp("test_x5", numbered=False)
+            """,
+            test_d=same_name.format("test_x6"),
+        )
+        pytester.inline_run(f"--basetemp={basetemp}").assertoutcome(passed=4)
+        # Once by mktemp; possibly once more at the end of the session.
+        assert listings[0] <= 2
 
     # issue #10502
     def test_policy_failed_removes_dir_when_skipped_from_fixture(

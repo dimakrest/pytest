@@ -1,0 +1,1 @@
+Creating a numbered directory, as pytest does for the session's ``pytest-of-<user>/pytest-<N>`` directory, now tries up to 1000 times instead of 10 when other processes or threads keep taking the next number first, and the final error is chained to the last ``OSError``.

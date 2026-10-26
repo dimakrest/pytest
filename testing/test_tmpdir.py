@@ -7,7 +7,9 @@ import os
 from pathlib import Path
 import shutil
 import stat
+import subprocess
 import sys
+import threading
 from typing import cast
 import warnings
 
@@ -554,6 +556,90 @@ class TestNumberedDir:
             # unix
             assert symlink.is_symlink()
             assert symlink.resolve() == d.resolve()
+
+    def test_make_threads(self, tmp_path):
+        made: list[str] = []
+
+        def worker() -> None:
+            for _ in range(100):
+                made.append(make_numbered_dir(root=tmp_path, prefix="shared-").name)
+
+        threads = [threading.Thread(target=worker) for _ in range(4)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        assert sorted(made) == sorted(f"shared-{i}" for i in range(400))
+
+    def test_make_processes(self, tmp_path):
+        script = (
+            "import sys; from pathlib import Path\n"
+            "from _pytest.pathlib import make_numbered_dir\n"
+            "for _ in range(100):\n"
+            "    print(make_numbered_dir(Path(sys.argv[1]), 'shared-').name)\n"
+        )
+        procs = [
+            subprocess.Popen(
+                [sys.executable, "-c", script, str(tmp_path)],
+                stdout=subprocess.PIPE,
+                encoding="utf-8",
+                text=True,
+            )
+            for _ in range(4)
+        ]
+        made = [name for p in procs for name in p.communicate()[0].split()]
+        assert [p.returncode for p in procs] == [0, 0, 0, 0]
+        assert len(made) == len(set(made)) == 400
+
+    def count_listings(self, monkeypatch) -> list[str]:
+        listed: list[str] = []
+        orig = pathlib.find_suffixes
+
+        def find_suffixes(root: Path, prefix: str):
+            listed.append(prefix)
+            return orig(root, prefix)
+
+        monkeypatch.setattr(pathlib, "find_suffixes", find_suffixes)
+        return listed
+
+    def test_make_retries_other_errors(self, tmp_path, monkeypatch):
+        # On Windows, creating a directory whose old one is still being
+        # deleted fails with PermissionError for a moment.
+        make_numbered_dir(root=tmp_path, prefix=self.PREFIX)
+        listed = self.count_listings(monkeypatch)
+        real_mkdir = Path.mkdir
+        failing = [tmp_path / "fun-1"]
+
+        def mkdir(self, *args, **kwargs):
+            if self in failing:
+                failing.remove(self)
+                raise PermissionError(13, "Access is denied", str(self))
+            return real_mkdir(self, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "mkdir", mkdir)
+        assert make_numbered_dir(root=tmp_path, prefix=self.PREFIX).name == "fun-1"
+        assert len(listed) == 2
+
+    def test_make_gives_up_on_other_errors_after_10_tries(self, tmp_path, monkeypatch):
+        listed = self.count_listings(monkeypatch)
+
+        def mkdir(self, *args, **kwargs):
+            raise PermissionError(13, "Permission denied", str(self))
+
+        monkeypatch.setattr(Path, "mkdir", mkdir)
+        with pytest.raises(OSError, match="after 10 tries") as excinfo:
+            make_numbered_dir(root=tmp_path, prefix=self.PREFIX)
+        assert isinstance(excinfo.value.__cause__, PermissionError)
+        assert len(listed) == 10
+
+    def test_make_gives_up_on_collisions_after_1000_tries(self, tmp_path, monkeypatch):
+        def mkdir(self, *args, **kwargs):
+            raise FileExistsError(17, "File exists", str(self))
+
+        monkeypatch.setattr(Path, "mkdir", mkdir)
+        with pytest.raises(OSError, match="after 1000 tries") as excinfo:
+            make_numbered_dir(root=tmp_path, prefix=self.PREFIX)
+        assert isinstance(excinfo.value.__cause__, FileExistsError)
 
     def test_cleanup_lock_create(self, tmp_path):
         d = tmp_path.joinpath("test")
